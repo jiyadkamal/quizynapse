@@ -1,9 +1,9 @@
 import { GameView } from "@/components/multiplayer/game-view";
-import { Suspense } from "react";
+import { Suspense, use } from "react";
 import { AuthGuard } from "@/components/auth-guard";
 
-export default function MultiplayerGamePage({ params }: { params: { sessionCode: string } }) {
-    const { sessionCode } = params;
+export default function MultiplayerGamePage({ params }: { params: Promise<{ sessionCode: string }> }) {
+    const { sessionCode } = use(params);
 
     return (
         <AuthGuard>

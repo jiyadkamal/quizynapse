@@ -54,15 +54,24 @@ export default function HostPage() {
                 router.push('/multiplayer');
             } else {
                 const sessionData = doc.data();
-                if (sessionData.state === 'active' || sessionData.state === 'leaderboard' || sessionData.state === 'finished') {
+                if (sessionData.state === 'active' || sessionData.state === 'leaderboard' || sessionData.state === 'finished' || sessionData.state === 'error') {
                     router.push(`/multiplayer/${sessionCode}/play`);
                 }
             }
+        }, (error) => {
+            console.error("Session listener error:", error);
+            toast({
+                title: "Connection Error",
+                description: "Could not connect to the session. Please check your Firestore security rules allow read access to the 'sessions' collection.",
+                variant: "destructive",
+            });
         });
 
         const playersCollection = collection(db, `sessions/${sessionCode}/players`);
         const unsubscribePlayers = onSnapshot(playersCollection, (snapshot) => {
             setPlayerCount(snapshot.size);
+        }, (error) => {
+            console.error("Players listener error:", error);
         });
         
         window.addEventListener('beforeunload', handleBeforeUnload);
@@ -75,7 +84,7 @@ export default function HostPage() {
     }, [sessionCode, router, toast, handleBeforeUnload]);
 
     const handleStartGame = async () => {
-        const isHostPlaying = !!localStorage.getItem(`player-${sessionCode}`);
+        const isHostPlaying = !!sessionStorage.getItem(`player-${sessionCode}`);
         if (isHostPlaying && playerCount < 1) {
              toast({
                 title: "Cannot start game",
@@ -97,8 +106,19 @@ export default function HostPage() {
         window.removeEventListener('beforeunload', handleBeforeUnload);
 
         try {
-            await startGame(sessionCode);
-            router.push(`/multiplayer/${sessionCode}/play`);
+            // Don't await - startGame now awaits question generation server-side.
+            // The onSnapshot listener above will detect state='active' and navigate
+            // to the play page automatically. We just need to kick it off.
+            startGame(sessionCode).catch((error) => {
+                console.error("Failed to start game:", error);
+                toast({
+                    title: "Error",
+                    description: "Failed to start the game. Please try again.",
+                    variant: "destructive",
+                });
+                setIsStarting(false);
+                window.addEventListener('beforeunload', handleBeforeUnload);
+            });
         } catch (error) {
             console.error("Failed to start game:", error);
             toast({

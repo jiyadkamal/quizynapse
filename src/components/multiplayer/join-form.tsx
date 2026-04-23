@@ -46,7 +46,8 @@ export function JoinMultiplayerForm() {
         const { playerId } = await joinSession(values.sessionCode, values.playerName);
 
         // Store player ID and name
-        localStorage.setItem(`player-${values.sessionCode}`, playerId);
+        // Store player ID per-tab (sessionStorage) so two tabs don't collide
+        sessionStorage.setItem(`player-${values.sessionCode}`, playerId);
         localStorage.setItem(`playerName-${values.sessionCode}`, values.playerName);
       
         router.push(`/multiplayer/${values.sessionCode}/play`);

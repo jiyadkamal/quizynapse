@@ -11,7 +11,6 @@ import { QuizQuestionCard } from "@/components/quiz-question-card";
 import { submitAnswer, showLeaderboard, nextQuestion, terminateSession } from "@/services/multiplayer-service";
 import { MultiplayerLeaderboard } from "./leaderboard";
 import { Button } from "../ui/button";
-import { Progress } from "../ui/progress";
 import { Timer } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -31,12 +30,13 @@ import QuizLoading from "@/app/quiz/_components/quiz-loading";
 interface Session {
     id: string;
     topics: string[];
-    state: 'waiting' | 'active' | 'leaderboard' | 'finished';
+    state: 'waiting' | 'active' | 'leaderboard' | 'finished' | 'error';
     currentQuestionIndex: number;
     questions: any[];
     questionTimer: number;
     isHostControlled: boolean;
     questionStartTime: Timestamp | null;
+    errorMessage?: string;
     [key: string]: any;
 }
 
@@ -46,7 +46,8 @@ interface Player {
     score: number;
 }
 
-const AUTO_MODE_LEADERBOARD_DELAY = 3000; // 3 seconds
+const AUTO_MODE_LEADERBOARD_DELAY = 2000; // 2 seconds
+const ALL_ANSWERED_LEADERBOARD_DELAY = 1500; // 1.5 seconds after all answered
 const AUTO_MODE_NEXT_QUESTION_DELAY = 5000; // 5 seconds
 
 export function GameView({ sessionCode }: { sessionCode: string }) {
@@ -63,9 +64,12 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
     const [quizStatus, setQuizStatus] = useState<'active' | 'reviewing'>('active');
     
     const [timer, setTimer] = useState(0);
-    const timerRef =  useRef<NodeJS.Timeout | null>(null);
+    const timerRef = useRef<NodeJS.Timeout | null>(null);
     const autoAdvanceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const [answeredPlayerCount, setAnsweredPlayerCount] = useState(0);
+
+    // Track the current "question round" to ensure timer and state resets happen correctly
+    const [questionRound, setQuestionRound] = useState(0);
 
     const isPlaying = !!playerId;
 
@@ -84,19 +88,22 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
         const hostCode = sessionStorage.getItem(`host-${sessionCode}`);
         setIsHost(hostCode === "true");
 
-        const storedPlayerId = localStorage.getItem(`player-${sessionCode}`);
+        const storedPlayerId = sessionStorage.getItem(`player-${sessionCode}`);
         setPlayerId(storedPlayerId);
 
     }, [sessionCode]);
 
-    const clearTimer = useCallback(() => {
-        if (timerRef.current) {
-            clearInterval(timerRef.current);
-            timerRef.current = null;
-        }
+    const clearAutoAdvance = useCallback(() => {
         if (autoAdvanceTimeoutRef.current) {
             clearTimeout(autoAdvanceTimeoutRef.current);
             autoAdvanceTimeoutRef.current = null;
+        }
+    }, []);
+
+    const stopTimer = useCallback(() => {
+        if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
         }
     }, []);
 
@@ -104,7 +111,8 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
         const currentSession = sessionDataRef.current;
         if (!currentSession || !playerId || quizStatusRef.current === 'reviewing' || !isPlaying) return;
 
-        clearTimer();
+        // Do NOT stop the timer here — it must keep counting down so
+        // canShowLeaderboard (timer === 0) eventually becomes true
         setQuizStatus('reviewing');
         setUserAnswer(answer);
         
@@ -112,14 +120,14 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
         const responseTimeMs = Date.now() - questionStartTime;
 
         try {
-            if (answer) {
-                 await submitAnswer(sessionCode, playerId, currentSession.currentQuestionIndex, answer, responseTimeMs);
-            }
+            // Always submit to Firestore — even for timeouts (empty string).
+            // This ensures answeredPlayerCount increments for all players.
+            await submitAnswer(sessionCode, playerId, currentSession.currentQuestionIndex, answer || '', responseTimeMs);
         } catch (e) {
             console.error(e);
             toast({ title: "Error", description: "Could not submit answer.", variant: "destructive" });
         }
-    }, [playerId, sessionCode, toast, clearTimer, isPlaying]);
+    }, [playerId, sessionCode, toast, isPlaying]);
 
     // Keep ref in sync
     useEffect(() => { handleAnswerSubmitRef.current = handleAnswerSubmit; }, [handleAnswerSubmit]);
@@ -141,11 +149,13 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
 
                 setSession(sessionData);
                 
+                // Reset quiz state when we move to a new question
                 if (sessionData.state === 'active' && previousQuestionIndex !== sessionData.currentQuestionIndex) {
                     setUserAnswer(null);
                     setQuizStatus('active');
                     setAnsweredPlayerCount(0);
-                    clearTimer();
+                    // Increment question round to trigger timer restart
+                    setQuestionRound(prev => prev + 1);
                 }
                 
                 if (sessionData.state === 'finished' && previousState !== 'finished') {
@@ -177,35 +187,69 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
         return () => {
             unsubscribeSession();
             unsubscribePlayers();
-            clearTimer();
+            stopTimer();
+            clearAutoAdvance();
         };
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [sessionCode]);
     
-    // Timer effect — only re-run when the actual question changes or quiz status changes,
-    // NOT on every Firestore update (which would reset the countdown)
+    // Timer countdown effect — pure countdown, NO side effects inside the updater.
+    // Only questionRound triggers a restart (when a new question begins).
     useEffect(() => {
-        clearTimer();
-        if (session && session.state === 'active' && quizStatus === 'active') {
-            setTimer(session.questionTimer); 
+        stopTimer();
+
+        if (session && session.state === 'active' && session.questions && session.questions.length > 0) {
+            const duration = session.questionTimer;
+            setTimer(duration);
+
             timerRef.current = setInterval(() => {
-                setTimer(prev => {
-                    if (prev <= 1) {
-                        clearTimer();
-                        if (isPlaying) {
-                            handleAnswerSubmitRef.current(null);
-                        } else {
-                            setQuizStatus('reviewing');
-                        }
-                        return 0;
-                    }
-                    return prev - 1
-                });
+                setTimer(prev => Math.max(0, prev - 1));
             }, 1000);
         }
-        return () => clearTimer();
+
+        return () => stopTimer();
+    // Only restart timer when a genuinely new question round starts
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [session?.state, session?.currentQuestionIndex, session?.questionTimer, quizStatus, clearTimer, isPlaying]);
+    }, [questionRound, isPlaying]);
+
+    // Timer expiration effect — handles side effects when timer reaches 0.
+    // Separated from the countdown to avoid calling server actions inside setState updaters,
+    // which causes "Cannot update Router while rendering" errors.
+    useEffect(() => {
+        if (timer === 0 && session?.state === 'active' && session?.questionTimer > 0 && session?.questions?.length > 0) {
+            stopTimer();
+            if (quizStatusRef.current === 'active') {
+                if (isPlaying) {
+                    handleAnswerSubmitRef.current(null);
+                } else {
+                    // Non-playing host: mark as reviewing
+                    setQuizStatus('reviewing');
+                }
+            }
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [timer]);
+
+    // All-players-answered effect — transition to reviewing immediately when
+    // every player has submitted, without waiting for the timer to expire.
+    // NOTE: We do NOT check quizStatusRef here because for a playing host,
+    // their own handleAnswerSubmit already set quizStatus to 'reviewing'.
+    // We still need to stop the timer and ensure non-playing hosts transition.
+    useEffect(() => {
+        if (
+            session?.state === 'active' &&
+            players.length > 0 &&
+            answeredPlayerCount >= players.length
+        ) {
+            // All players answered — stop the timer
+            stopTimer();
+            // Transition to reviewing if not already there
+            if (quizStatusRef.current === 'active') {
+                setQuizStatus('reviewing');
+            }
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [answeredPlayerCount, players.length, session?.state]);
 
     // Track number of players who answered — only re-subscribe when question changes
     useEffect(() => {
@@ -226,11 +270,17 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
             return;
         }
 
+        clearAutoAdvance();
+
         // Transition from active question to leaderboard
         if (session.state === 'active' && quizStatus === 'reviewing') {
+            // Use a shorter delay if all players answered early
+            const delay = answeredPlayerCount >= players.length
+                ? ALL_ANSWERED_LEADERBOARD_DELAY
+                : AUTO_MODE_LEADERBOARD_DELAY;
             autoAdvanceTimeoutRef.current = setTimeout(() => {
                 showLeaderboard(sessionCode);
-            }, AUTO_MODE_LEADERBOARD_DELAY);
+            }, delay);
         }
 
         // Transition from leaderboard to next question
@@ -240,13 +290,9 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
             }, AUTO_MODE_NEXT_QUESTION_DELAY);
         }
 
-        return () => {
-            if (autoAdvanceTimeoutRef.current) {
-                clearTimeout(autoAdvanceTimeoutRef.current);
-            }
-        }
+        return () => clearAutoAdvance();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [session?.state, session?.isHostControlled, quizStatus, isHost, sessionCode]);
+    }, [session?.state, session?.isHostControlled, quizStatus, isHost, sessionCode, answeredPlayerCount, players.length]);
     
     const handleNext = async () => {
         if (!session || !isHost) return;
@@ -293,6 +339,29 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
         return (
            <QuizLoading topic={session.topics.map((t: any) => t.name || t).join(', ')} />
        )
+    }
+
+    if (session.state === 'error') {
+        return (
+            <div className="w-full max-w-md text-center space-y-6">
+                <Card className="border-destructive/50">
+                    <CardHeader>
+                        <CardTitle className="text-2xl font-headline text-destructive">Something Went Wrong</CardTitle>
+                        <CardDescription>
+                            {session.errorMessage || "An error occurred while generating questions."}
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                        <p className="text-sm text-muted-foreground">
+                            This is usually caused by a temporary AI service issue. Please try creating a new session.
+                        </p>
+                        <Button onClick={() => router.push('/multiplayer')} className="w-full">
+                            Back to Multiplayer Menu
+                        </Button>
+                    </CardContent>
+                </Card>
+            </div>
+        )
     }
 
     const ExitButton = () => (
@@ -353,7 +422,16 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
     }
     
     const totalPlayers = players.length;
-    const canShowLeaderboard = timer === 0 || answeredPlayerCount === totalPlayers;
+    // The host can show leaderboard once reviewing (which now triggers
+    // immediately when all players answer OR when the timer expires).
+    const allPlayersAnswered = totalPlayers > 0 && answeredPlayerCount >= totalPlayers;
+    const canShowLeaderboard = timer === 0 || allPlayersAnswered;
+
+    // DEBUG: trace the exact values on every render
+    console.log(`[GameView RENDER] isHost=${isHost}, isPlaying=${isPlaying}, playerId=${playerId}, quizStatus=${quizStatus}, answeredPlayerCount=${answeredPlayerCount}, totalPlayers=${totalPlayers}, allPlayersAnswered=${allPlayersAnswered}, canShowLeaderboard=${canShowLeaderboard}, timer=${timer}, isHostControlled=${session.isHostControlled}`);
+
+    // Calculate time bar progress (percentage of time remaining)
+    const timerProgress = session.questionTimer > 0 ? (timer / session.questionTimer) * 100 : 0;
 
     return (
         <div className="w-full max-w-3xl relative">
@@ -367,11 +445,21 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
                     <p className="text-lg">Question {session.currentQuestionIndex + 1} of {session.questions.length}</p>
                     {session.delivery === 'topic-wise' && <p className="text-lg font-bold text-primary">{typeof currentQuestion.topic === 'object' ? (currentQuestion.topic as any)?.name || 'Unknown' : currentQuestion.topic}</p>}
                 </div>
-                <Progress value={((session.currentQuestionIndex + 1) / session.questions.length) * 100} className="h-3" />
+                {/* Single time bar that depletes as time runs out */}
+                <div className="relative w-full h-3 bg-muted rounded-full overflow-hidden">
+                    <div 
+                        className={cn(
+                            "h-full rounded-full transition-all duration-1000 ease-linear",
+                            timer > 5 ? "bg-primary" : "bg-destructive"
+                        )}
+                        style={{ width: `${timerProgress}%` }}
+                    />
+                </div>
             </div>
             
             {isPlaying ? (
                 <QuizQuestionCard
+                    key={`q-${session.currentQuestionIndex}-${questionRound}`}
                     questionData={currentQuestion}
                     onSubmit={handleAnswerSubmit}
                     status={quizStatus}
@@ -381,30 +469,63 @@ export function GameView({ sessionCode }: { sessionCode: string }) {
                  <Card className="w-full shadow-lg animate-fade-in text-center">
                     <CardHeader>
                         <CardTitle className="text-2xl font-headline leading-tight">{currentQuestion.question}</CardTitle>
-                        <CardDescription>Players are answering... ({answeredPlayerCount}/{totalPlayers})</CardDescription>
+                        <CardDescription>
+                            {allPlayersAnswered
+                                ? `All players have answered! (${answeredPlayerCount}/${totalPlayers})`
+                                : `Players are answering... (${answeredPlayerCount}/${totalPlayers})`
+                            }
+                        </CardDescription>
                     </CardHeader>
                      <CardContent>
-                        <Loader2 className="h-8 w-8 animate-spin text-primary"/>
+                        {allPlayersAnswered ? (
+                            <div className="text-green-500 font-semibold text-lg">✓ Ready to proceed</div>
+                        ) : (
+                            <Loader2 className="h-8 w-8 animate-spin text-primary"/>
+                        )}
                     </CardContent>
                 </Card>
             )}
 
 
-            {quizStatus === 'reviewing' && (
+            {/* Host controls: show as soon as canShowLeaderboard is true, independent of quizStatus */}
+            {isHost && session.isHostControlled && canShowLeaderboard && (
                 <div className="mt-8 text-center">
-                    {isHost && session.isHostControlled ? (
-                        <Button 
-                            onClick={handleNext} 
-                            className="w-1/2 text-lg py-6 animate-fade-in"
-                            disabled={!canShowLeaderboard}
-                        >
-                            {canShowLeaderboard ? 'Show Leaderboard' : `Waiting for players... (${answeredPlayerCount}/${totalPlayers})`}
-                        </Button>
-                    ) : (
-                        <div className="text-muted-foreground animate-pulse text-lg">
-                            {session.isHostControlled ? 'Waiting for host to show leaderboard...' : 'Revealing leaderboard...'}
-                        </div>
-                    )}
+                    <Button 
+                        onClick={handleNext} 
+                        className="w-1/2 text-lg py-6 animate-fade-in"
+                    >
+                        Show Leaderboard
+                    </Button>
+                </div>
+            )}
+
+            {/* Host waiting indicator: show when host is reviewing but not all players answered yet */}
+            {isHost && session.isHostControlled && quizStatus === 'reviewing' && !canShowLeaderboard && (
+                <div className="mt-8 text-center">
+                    <Button 
+                        className="w-1/2 text-lg py-6 animate-fade-in"
+                        disabled
+                    >
+                        Waiting for players... ({answeredPlayerCount}/{totalPlayers})
+                    </Button>
+                </div>
+            )}
+
+            {/* Non-host players: show status when reviewing or all answered */}
+            {!isHost && (quizStatus === 'reviewing' || canShowLeaderboard) && (
+                <div className="mt-8 text-center">
+                    <div className="text-muted-foreground animate-pulse text-lg">
+                        {session.isHostControlled ? 'Waiting for host to show leaderboard...' : 'Revealing leaderboard...'}
+                    </div>
+                </div>
+            )}
+
+            {/* Auto-mode host: show status when reviewing */}
+            {isHost && !session.isHostControlled && (quizStatus === 'reviewing' || canShowLeaderboard) && (
+                <div className="mt-8 text-center">
+                    <div className="text-muted-foreground animate-pulse text-lg">
+                        Revealing leaderboard...
+                    </div>
                 </div>
             )}
         </div>

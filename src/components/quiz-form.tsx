@@ -229,12 +229,12 @@ export function QuizForm() {
             name="questionCount"
             render={({ field }) => (
                 <FormItem>
-                    <FormLabel>Number of Questions Per Topic</FormLabel>
+                    <FormLabel>Total Number of Questions</FormLabel>
                     <div className="flex items-center gap-4">
                         <FormControl>
                             <Slider
                                 min={1}
-                                max={10}
+                                max={20}
                                 step={1}
                                 value={[field.value]}
                                 onValueChange={(value) => field.onChange(value[0])}

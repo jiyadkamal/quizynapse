@@ -121,8 +121,8 @@ export function CreateMultiplayerForm() {
         sessionStorage.setItem(`host-${sessionCode}`, "true");
 
         if (hostPlayerId) {
-            // If the host is playing, store their player ID.
-            localStorage.setItem(`player-${sessionCode}`, hostPlayerId);
+            // If the host is playing, store their player ID (sessionStorage = per-tab).
+            sessionStorage.setItem(`player-${sessionCode}`, hostPlayerId);
         }
 
         router.push(`/multiplayer/${sessionCode}/host`);

@@ -114,9 +114,11 @@ export async function startGame(sessionCode: string) {
         state: 'active',
     });
 
-    // Now, run the long-running question generation in the background.
-    // We don't await this, so the client-side host can navigate immediately.
-    generateAndSetQuestions(sessionCode);
+    // Await question generation. The client already shows a loading screen
+    // while state is 'active' and questions are empty.
+    // NOTE: This must be awaited because Next.js server actions terminate
+    // background work when the response is sent, causing ECONNRESET errors.
+    await generateAndSetQuestions(sessionCode);
 }
 
 async function generateAndSetQuestions(sessionCode: string) {
@@ -127,79 +129,110 @@ async function generateAndSetQuestions(sessionCode: string) {
         const sessionData = sessionDoc.data();
         if (!sessionData) throw new Error("Session data not found during question generation.");
 
-        const questionsPayload = await generateQuizQuestions({
-            topics: sessionData.topics,
-            delivery: sessionData.delivery,
-            difficulty: sessionData.difficulty,
-            count: sessionData.questionCount,
-        });
+        // Retry logic for AI model 503 errors (high demand)
+        const MAX_RETRIES = 3;
+        let lastError: Error | null = null;
 
-        // Once questions are generated, update the document.
-        // This will trigger the listener on the clients to display the first question.
-        await sessionRef.update({
-            questions: questionsPayload.questions,
-            currentQuestionIndex: 0,
-            questionStartTime: FieldValue.serverTimestamp(),
-        });
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                const questionsPayload = await generateQuizQuestions({
+                    topics: sessionData.topics,
+                    delivery: sessionData.delivery,
+                    difficulty: sessionData.difficulty,
+                    count: sessionData.questionCount,
+                });
+
+                // Once questions are generated, update the document.
+                // This will trigger the listener on the clients to display the first question.
+                await sessionRef.update({
+                    questions: questionsPayload.questions,
+                    currentQuestionIndex: 0,
+                    questionStartTime: FieldValue.serverTimestamp(),
+                });
+                return; // Success — exit the function
+            } catch (genError) {
+                lastError = genError instanceof Error ? genError : new Error(String(genError));
+                const errorMessage = lastError.message || '';
+                const isRetryable = errorMessage.includes('503') || errorMessage.includes('Service Unavailable') || errorMessage.includes('high demand') || errorMessage.includes('RESOURCE_EXHAUSTED');
+                
+                if (isRetryable && attempt < MAX_RETRIES - 1) {
+                    const delay = Math.pow(2, attempt) * 2000; // 2s, 4s, 8s
+                    console.warn(`AI model unavailable (attempt ${attempt + 1}/${MAX_RETRIES}). Retrying in ${delay}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                } else {
+                    throw lastError; // Non-retryable error or last attempt — propagate
+                }
+            }
+        }
      } catch(error) {
         console.error("Failed to generate and set questions:", error);
-        // If question generation fails, we should probably set the session state to an error state.
-        // For now, we'll terminate it to prevent it from being stuck.
-        await terminateSession(sessionCode);
+        // Set the session to an error state so the host can see what happened
+        // instead of abruptly deleting the session.
+        try {
+            await sessionRef.update({
+                state: 'error',
+                errorMessage: `Question generation failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            });
+        } catch (updateError) {
+            console.error("Failed to update session with error state:", updateError);
+        }
      }
 }
+
 
 
 export async function submitAnswer(sessionCode: string, playerId: string, questionIndex: number, answer: string, responseTimeMs: number) {
     const sessionRef = db.collection("sessions").doc(sessionCode);
     const playerRef = db.collection(`sessions/${sessionCode}/players`).doc(playerId);
-    
-    // Using a transaction to ensure atomicity
-    await db.runTransaction(async (transaction) => {
-        const sessionDoc = await transaction.get(sessionRef);
-        
-        if (!sessionDoc.exists) {
-            throw new Error("Session not found.");
-        }
-        
-        const sessionData = sessionDoc.data();
-        if (!sessionData) {
-            throw new Error("Session data not found.");
-        }
+    // Use playerId as the answer document ID to naturally prevent duplicate submissions
+    const answerDocRef = db.collection(`sessions/${sessionCode}/questions/${questionIndex}/answers`).doc(playerId);
 
-        const question = sessionData.questions[questionIndex];
-        const isCorrect = question.correctAnswer === answer;
-        
-        let points = 0;
-        if (isCorrect) {
-            // Points are based on correctness and speed. Max 100 points for speed.
-            const timePenalty = Math.floor(responseTimeMs / (sessionData.questionTimer * 10));
-            points = 100 + Math.max(0, 100 - timePenalty);
-        }
+    console.log(`[submitAnswer] Player ${playerId} answering Q${questionIndex} in session ${sessionCode}. Answer: "${answer}", responseTimeMs: ${responseTimeMs}`);
 
-        const answerCollectionRef = db.collection(`sessions/${sessionCode}/questions/${questionIndex}/answers`);
+    // Check if already answered (using the deterministic doc ID)
+    const existingAnswer = await answerDocRef.get();
+    if (existingAnswer.exists) {
+        console.log(`[submitAnswer] Player ${playerId} already answered Q${questionIndex}. Skipping.`);
+        return;
+    }
 
-        // Check if user has already answered this question
-        const existingAnswerQuery = await transaction.get(answerCollectionRef.where('playerId', '==', playerId));
-        if (!existingAnswerQuery.empty) {
-             // Already answered, do nothing.
-            return;
-        }
+    // Read session data to check the correct answer
+    const sessionDoc = await sessionRef.get();
+    if (!sessionDoc.exists) {
+        throw new Error("Session not found.");
+    }
 
-        // Record the answer for this question
-        transaction.set(answerCollectionRef.doc(), {
-            playerId,
-            answer,
-            isCorrect,
-            points,
-            responseTimeMs,
-        });
+    const sessionData = sessionDoc.data();
+    if (!sessionData) {
+        throw new Error("Session data not found.");
+    }
 
-        // Update player's total score if they got it right
-        if (points > 0) {
-            transaction.update(playerRef, { score: FieldValue.increment(points) });
-        }
+    const question = sessionData.questions[questionIndex];
+    const isCorrect = question.correctAnswer === answer;
+
+    let points = 0;
+    if (isCorrect) {
+        // Points are based on correctness and speed. Max 100 points for speed.
+        const timePenalty = Math.floor(responseTimeMs / (sessionData.questionTimer * 10));
+        points = 100 + Math.max(0, 100 - timePenalty);
+    }
+
+    console.log(`[submitAnswer] Player ${playerId}: isCorrect=${isCorrect}, points=${points}, correctAnswer="${question.correctAnswer}"`);
+
+    // Write the answer document (keyed by playerId, so it's idempotent)
+    await answerDocRef.set({
+        playerId,
+        answer,
+        isCorrect,
+        points,
+        responseTimeMs,
     });
+
+    // Update player's total score if they got it right
+    if (points > 0) {
+        await playerRef.update({ score: FieldValue.increment(points) });
+        console.log(`[submitAnswer] Player ${playerId}: score incremented by ${points}`);
+    }
 }
 
 export async function nextQuestion(sessionCode: string) {

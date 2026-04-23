@@ -1,0 +1,42 @@
+sessions
+-----------------------------------------------------------------------
+Field Name       | Data Type | Constraints
+-----------------------------------------------------------------------
+Document ID      | String    | PK 
+topics           | Array     |
+delivery         | String    |
+difficulty       | String    |
+questionCount    | Number    |
+questionTimer    | Number    |
+isHostControlled | Boolean   |
+questions        | Array     |
+createdAt        | Timestamp |
+state            | String    |
+currentQuestionIndex | Number |
+questionStartTime | Timestamp |
+hostPlayerId     | String    | FK
+errorMessage     | String    |
+-----------------------------------------------------------------------
+
+players 
+-----------------------------------------------------------------------
+Field Name       | Data Type | Constraints
+-----------------------------------------------------------------------
+Document ID      | String    | PK
+name             | String    |
+score            | Number    |
+isHost           | Boolean   |
+joinedAt         | Timestamp |
+-----------------------------------------------------------------------
+
+answers 
+-----------------------------------------------------------------------
+Field Name       | Data Type | Constraints
+-----------------------------------------------------------------------
+Document ID      | String    | PK
+playerId         | String    | FK
+answer           | String    |
+isCorrect        | Boolean   |
+points           | Number    |
+responseTimeMs   | Number    |
+-----------------------------------------------------------------------

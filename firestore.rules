@@ -1,0 +1,27 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Sessions collection - allow authenticated users to read/write
+    match /sessions/{sessionCode} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update: if request.auth != null;
+      allow delete: if request.auth != null;
+
+      // Players subcollection
+      match /players/{playerId} {
+        allow read: if request.auth != null;
+        allow create: if request.auth != null;
+        allow update: if request.auth != null;
+      }
+
+      // Questions and answers subcollection
+      match /questions/{questionId}/answers/{answerId} {
+        allow read: if request.auth != null;
+        allow create: if request.auth != null;
+      }
+    }
+  }
+}

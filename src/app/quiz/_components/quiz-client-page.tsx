@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { generateQuizQuestions } from "@/ai/flows/generate-quiz-questions";
 import type { GenerateQuizQuestionsOutput, GenerateQuizQuestionsInput, SingleQuestion } from "@/ai/schemas/quiz-schema";
@@ -41,40 +41,55 @@ export default function QuizClientPage() {
   const [status, setStatus] = useState<"loading" | "active" | "reviewing">("loading");
   const [userAnswer, setUserAnswer] = useState<string | null>(null);
 
-  const topicParams = searchParams.getAll("topic") || [];
-  const topics: Topic[] = topicParams.map(tp => {
-    const parts = tp.split(':');
-    return parts.length > 1 ? { name: parts[0], startYear: Number(parts[1]) } : { name: parts[0] };
-  });
+  const topics = useMemo(() => {
+    const topicParams = searchParams.getAll("topic") || [];
+    return topicParams.map(tp => {
+      const parts = tp.split(':');
+      return parts.length > 1 ? { name: parts[0], startYear: Number(parts[1]) } : { name: parts[0] };
+    });
+  }, [searchParams]);
+
   const delivery = (searchParams.get("delivery") as "topic-wise" | "mixed") || "mixed";
   const difficulty = (searchParams.get("difficulty") as "Easy" | "Medium" | "Hard") || "Easy";
-  const questionCountPerTopic = parseInt(searchParams.get("questionCount") || '5', 10);
+  const questionCount = parseInt(searchParams.get("questionCount") || '5', 10);
   
-  const totalQuestions = topics.length * questionCountPerTopic;
+  // Note: Total questions is based on actual generated questions length,
+  // but we estimate it here for the progress bar initially.
+  const [totalQuestions, setTotalQuestions] = useState(0);
   const questionTimerSeconds = getTimerDuration(difficulty);
   const [timer, setTimer] = useState(questionTimerSeconds);
+  const loadingStartedRef = useRef(false);
+
+  // Track the current "question round" — incremented on each new question.
+  // This is the ONLY dependency for the timer effect, ensuring a clean restart.
+  const [questionRound, setQuestionRound] = useState(0);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  // Ref to track whether the current question has already been timed out.
+  // This prevents the timeout from firing more than once per question.
+  const timedOutRef = useRef(false);
 
-  const clearTimer = () => {
+  const clearTimer = useCallback(() => {
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
-  };
+  }, []);
 
   const loadQuestions = useCallback(async () => {
+    if (topics.length === 0) return;
     setStatus("loading");
     try {
         const input: GenerateQuizQuestionsInput = { 
             topics,
             delivery,
             difficulty, 
-            count: questionCountPerTopic,
+            count: questionCount,
         };
 
       const result = await generateQuizQuestions(input);
       setQuestions(result.questions);
+      setTotalQuestions(result.questions.length);
       setStatus("active");
     } catch (error) {
       console.error("Failed to generate questions:", error);
@@ -85,15 +100,22 @@ export default function QuizClientPage() {
       });
       router.push("/play");
     }
-  }, [topics, delivery, difficulty, router, toast, questionCountPerTopic]);
+  }, [topics, delivery, difficulty, router, toast, questionCount]);
 
   useEffect(() => {
-    if (topics.length > 0 && questions.length === 0) {
+    if (topics.length > 0 && questions.length === 0 && status === "loading" && !loadingStartedRef.current) {
+      loadingStartedRef.current = true;
       loadQuestions();
     }
-  }, [topics, loadQuestions, questions.length]);
+  }, [topics.length, loadQuestions, questions.length, status]);
+
+  // Use a ref for handleAnswerSubmit so the timeout effect doesn't
+  // need it in its dependency array (which was causing cascading re-fires).
+  const statusRef = useRef(status);
+  useEffect(() => { statusRef.current = status; }, [status]);
 
   const handleAnswerSubmit = useCallback((answer: string | null) => {
+    if (statusRef.current !== 'active') return;
     clearTimer();
     setUserAnswer(answer);
     if (answer) {
@@ -103,31 +125,49 @@ export default function QuizClientPage() {
       }
     }
     setStatus("reviewing");
-  }, [questions, currentQuestionIndex]);
+  }, [questions, currentQuestionIndex, clearTimer]);
 
+  const handleAnswerSubmitRef = useRef(handleAnswerSubmit);
+  useEffect(() => { handleAnswerSubmitRef.current = handleAnswerSubmit; }, [handleAnswerSubmit]);
+
+  // Timer countdown effect — ONLY restarts when questionRound changes.
+  // This avoids the cascade where status/handleAnswerSubmit changes
+  // could cause the timer or timeout effects to re-fire.
   useEffect(() => {
-    if (status === 'active') {
-      setTimer(questionTimerSeconds);
-      timerRef.current = setInterval(() => {
-        setTimer(prev => prev - 1);
-      }, 1000);
+    clearTimer();
+    // Only start if we actually have questions loaded
+    if (questions.length === 0) return;
 
-      return () => clearTimer();
-    }
-  }, [status, currentQuestionIndex, questionTimerSeconds]);
+    timedOutRef.current = false;
+    setTimer(questionTimerSeconds);
 
+    timerRef.current = setInterval(() => {
+      setTimer(prev => Math.max(0, prev - 1));
+    }, 1000);
+
+    return () => clearTimer();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [questionRound]);
+
+  // Timer expiration effect — uses refs to avoid dependency on
+  // handleAnswerSubmit or status, which would cause cascading re-fires.
   useEffect(() => {
-    if (timer === 0 && status === 'active') {
-      handleAnswerSubmit(null); // Timeout
+    if (timer === 0 && statusRef.current === 'active' && !timedOutRef.current) {
+      timedOutRef.current = true;
+      handleAnswerSubmitRef.current(null);
     }
-  }, [timer, status, handleAnswerSubmit]);
+  }, [timer]);
 
   const handleNextQuestion = () => {
+    if (status !== 'reviewing') return;
+    
     const nextIndex = currentQuestionIndex + 1;
     if (nextIndex < totalQuestions) {
       setCurrentQuestionIndex(nextIndex);
-      setStatus("active");
       setUserAnswer(null);
+      setStatus("active");
+      // Increment questionRound to trigger a clean timer restart via the effect
+      setQuestionRound(prev => prev + 1);
     } else {
         const params = new URLSearchParams({
             score: score.toString(),
@@ -175,7 +215,7 @@ export default function QuizClientPage() {
 
       {currentQuestion && (
         <QuizQuestionCard
-          key={currentQuestion.question}
+          key={`question-${currentQuestionIndex}-${currentQuestion.question}`}
           questionData={currentQuestion}
           onSubmit={handleAnswerSubmit}
           status={status}

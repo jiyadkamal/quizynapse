@@ -85,16 +85,26 @@ const generateQuizQuestionsFlow = ai.defineFlow(
     outputSchema: GenerateQuizQuestionsOutputSchema,
   },
   async (input) => {
-    const { topics, difficulty, count, delivery } = input;
+    const { topics, difficulty, count: totalCount, delivery } = input;
     let allQuestions: SingleQuestion[] = [];
 
+    // Calculate questions per topic
+    const baseCount = Math.floor(totalCount / topics.length);
+    const remainder = totalCount % topics.length;
+
     // Generate questions for each topic
-    for (const topic of topics) {
+    for (let i = 0; i < topics.length; i++) {
+      const topic = topics[i];
+      // Distribute the remainder across the first few topics
+      const countForThisTopic = baseCount + (i < remainder ? 1 : 0);
+      
+      if (countForThisTopic === 0) continue;
+
       const existingQuestionTexts = allQuestions.map(q => q.question);
       const result = await generateSingleTopicPrompt({
         topic: topic.name,
         difficulty,
-        count,
+        count: countForThisTopic,
         startYear: topic.startYear,
         existingQuestions: existingQuestionTexts,
       });
@@ -102,12 +112,18 @@ const generateQuizQuestionsFlow = ai.defineFlow(
       const newQuestions = result.output?.questions || [];
       // Add the topic to each question object
       const questionsWithTopic = newQuestions.map(q => ({ ...q, topic: topic.name }));
-      allQuestions.push(...questionsWithTopic);
+      // Truncate to exactly the requested count for this topic
+      allQuestions.push(...questionsWithTopic.slice(0, countForThisTopic));
     }
 
     // If delivery is mixed, shuffle the questions
     if (delivery === 'mixed') {
       allQuestions = shuffle(allQuestions);
+    }
+
+    // Final safety: ensure total count is exactly totalCount
+    if (allQuestions.length > totalCount) {
+      allQuestions = allQuestions.slice(0, totalCount);
     }
 
     return { questions: allQuestions };
